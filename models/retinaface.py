@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.models.detection.backbone_utils as backbone_utils
@@ -5,10 +6,16 @@ import torchvision.models._utils as _utils
 import torch.nn.functional as F
 from collections import OrderedDict
 
-from models.net import MobileNetV1 as MobileNetV1
-from models.net import FPN as FPN
-from models.net import SSH as SSH
+from .net import MobileNetV1 as MobileNetV1
+from .net import FPN as FPN
+from .net import SSH as SSH
 
+# for PhantomSponges use
+from attack.Retinaface.data import cfg_re50
+from attack.Retinaface.layers.functions.prior_box import PriorBox
+from attack.Retinaface.utils.nms.py_cpu_nms import py_cpu_nms
+from attack.Retinaface.utils.box_utils import decode, decode_landm
+from attack.Retinaface.utils.timer import Timer
 
 
 class ClassHead(nn.Module):
@@ -52,6 +59,13 @@ class RetinaFace(nn.Module):
         :param phase: train or test.
         """
         super(RetinaFace,self).__init__()
+
+        # for predict_on_batch use
+        self.cfg = cfg
+        self.anchor_num = 896 # copy from blazeface, it can be any number to fix the detections output size
+        self.confidence_threshold = 0.05 # change it to maximize the performance of generation
+        self.nms_threshold = 0.01 # change it to maximize the performance of generation
+
         self.phase = phase
         backbone = None
         if cfg['name'] == 'mobilenet0.25':
@@ -125,3 +139,86 @@ class RetinaFace(nn.Module):
         else:
             output = (bbox_regressions, F.softmax(classifications, dim=-1), ldm_regressions)
         return output
+    
+    # for PhantomSponges use
+
+    def predict_on_batch(self, img_batch):
+        '''
+        This follows the output format from BlazeFace to adapt to UAP generation.
+        Returns:
+            A list containing a tensor of face detections for each image in 
+            the batch. If no faces are found for an image, returns a tensor
+            of shape (anchor_num, 17).
+        Each face detection is a PyTorch tensor consisting of 17 numbers:
+            - x, y, w, h
+            - x,y-coordinates for the 6 keypoints, all 0 here
+            - confidence score
+        '''
+        batch_detections = []
+        # testing dataset
+        _t = {'forward_pass': Timer(), 'misc': Timer()}
+    
+        # testing begin
+        for i, img in enumerate(img_batch):
+            modified_img = img * 255 # input image is 0-1 but model input must be 0-255
+            face_tensors = torch.zeros([self.anchor_num, 17], dtype=torch.float)
+    
+            # testing scale
+            _, im_height, im_width = modified_img.shape
+            scale = torch.Tensor([modified_img.shape[2], modified_img.shape[1], modified_img.shape[2], modified_img.shape[1]])
+            rgb_means = torch.tensor([104, 117, 123], dtype=modified_img.dtype)
+            modified_img -= rgb_means.view(3, 1, 1)
+            modified_img = modified_img.unsqueeze(0)
+    
+            _t['forward_pass'].tic()
+            loc, conf, landms = self.forward(modified_img)  # forward pass
+            _t['forward_pass'].toc()
+            _t['misc'].tic()
+            priorbox = PriorBox(self.cfg, image_size=(im_height, im_width))
+            priors = priorbox.forward()
+            prior_data = priors.data
+            boxes = decode(loc.data.squeeze(0), prior_data, self.cfg['variance'])
+            boxes = boxes * scale
+            boxes = boxes.cpu().numpy()
+            scores = conf.squeeze(0).data.cpu().numpy()[:, 1]
+            landms = decode_landm(landms.data.squeeze(0), prior_data, self.cfg['variance'])
+            scale1 = torch.Tensor([modified_img.shape[3], modified_img.shape[2], modified_img.shape[3], modified_img.shape[2],
+                                   modified_img.shape[3], modified_img.shape[2], modified_img.shape[3], modified_img.shape[2],
+                                   modified_img.shape[3], modified_img.shape[2]])
+            landms = landms * scale1
+            landms = landms.cpu().numpy()
+    
+            # ignore low scores
+            inds = np.where(scores > self.confidence_threshold)[0]
+            boxes = boxes[inds]
+            landms = landms[inds]
+            scores = scores[inds]
+    
+            # keep top-K before NMS
+            order = scores.argsort()[::-1]
+            boxes = boxes[order]
+            landms = landms[order]
+            scores = scores[order]
+    
+            # do NMS
+            dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
+            keep = py_cpu_nms(dets, self.nms_threshold)
+            dets = dets[keep, :]
+            landms = landms[keep]
+    
+            dets = np.concatenate((dets, landms), axis=1)
+            _t['misc'].toc()
+    
+            # based on uap_phantom_sponge.py, bboxes_area function will take in [x, y, w, h] 
+            bboxs = dets
+            for idx, box in enumerate(bboxs):
+                x = int(box[0])
+                y = int(box[1])
+                w = int(box[2]) - int(box[0])
+                h = int(box[3]) - int(box[1])
+                face_tensor = [x, y, w, h] + ([0 for i in range(12)]) + [box[4]] # 17 values
+                face_tensors[idx] = torch.tensor(face_tensor)
+            batch_detections.append(face_tensors)
+            print('im_detect: {:d}/{:d} forward_pass_time: {:.4f}s misc: {:.4f}s'.format(i + 1, len(img_batch), _t['forward_pass'].average_time, _t['misc'].average_time))
+        
+        return batch_detections
